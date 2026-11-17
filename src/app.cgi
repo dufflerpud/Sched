@@ -41,11 +41,12 @@ use cpi_vars;
 use cpi_file qw( fatal echodo read_lines write_lines );
 use cpi_arguments qw( parse_arguments );
 use cpi_send_file qw( sendmail );
-use cpi_time qw( parsedate revlocaltime );
+use cpi_time qw( parsedate revlocaltime time_string );
 use cpi_translate qw( xprint );
 use cpi_cgi qw( CGIreceive CGIheader );
 use cpi_user qw( logout_select );
 use cpi_setup qw( setup );
+use cpi_inlist qw( inlist );
 
 $| = 1;
 
@@ -70,7 +71,8 @@ my $FORM_NAME		= "form";
 
 my $address;
 my %entries;
-my ($tsec,$tmin,$thour,$tmday,$tmonth,$tyear,$twday);
+#my ($tsec,$tmin,$thour,$tmday,$tmonth,$tyear,$twday);
+my ($tyear,$tmonth,$tmday,$thour,$tmin,$tsec,$twday);
 my $UnixDateOffset	= 18000;
 my %start_at;
 my %stop_at;
@@ -80,7 +82,9 @@ our %ONLY_ONE_DEFAULTS =
     "datetime"		=>	time(),
     "file"		=>	"$cpi_vars::BASEDIR/lib/remind.txt",
     "newfile"		=>	"$cpi_vars::BASEDIR/lib/remind.new",
-    "mode"		=>	[ "remind", "sort", "html" ],
+    "mode"		=>	[ "show", "mail", "sort", "html" ],
+    "show"		=>	{ "alias"=>["-mode=show"] },
+    "mail"		=>	{ "alias"=>["-mode=mail"] },
     "sort"		=>	{ "alias"=>["-mode=sort"] },
     "html"		=>	{ "alias"=>["-mode=html"] },
     "verbosity"		=>	0,
@@ -168,7 +172,7 @@ sub make_entry
     push( @{$entries{$address}{all}}, $entry );
     push( @all_records, $entry );
     $record_number++;
-    printf( "%s %s %s\n", $entry->{whenstr}, $entry, $entry->{rest} )
+    printf( "%d %s %s %s\n", $entry->{record}, $entry->{whenstr}, $entry, $entry->{rest} )
 	if( $ARGS{verbosity} > 1 );
     return $entry;
     }
@@ -265,9 +269,14 @@ sub read_remind_file
 #########################################################################
 #	Go through entrys hash figuring out e-mail.			#
 #########################################################################
-sub do_mail
+sub generate_message
     {
-    my $now_day = $ARGS{datetime} - ($ARGS{datetime} % $DAY_IN_SECONDS);
+    my( $mode ) = @_;
+    #my $now_day = $ARGS{datetime} - ($ARGS{datetime} % $DAY_IN_SECONDS);
+    my $now_day = $ARGS{datetime};
+    print "generate_message now_day="
+        .&time_string("%04d-%02d-%02d %02d:%02d:%02d.%d.\n",$now_day)
+	if( $ARGS{verbosity} > 1 );
 
     my %day_flags;
     foreach my $daytype ( @MAIL_TYPES )
@@ -289,7 +298,7 @@ sub do_mail
 		    : "in $offset days" ) . ":\n";
 		my( $cyear, $cmonth, $cmday ) =
 		    &epoch_to_ymd($now_day + $offset*$DAY_IN_SECONDS);
-		#printf( "CMC ymd=%04d-%02d-%02d\n",$cyear,$cmonth,$cmday);
+		#$txt .= sprintf( "CMC ymd=%04d-%02d-%02d\n",$cyear,$cmonth,$cmday);
 		foreach my $entry (
 		    sort {$a->{hhmm} cmp $b->{hhmm}}
 		    &matching_entries($address,$cyear,$cmonth,$cmday) )
@@ -308,7 +317,7 @@ sub do_mail
     #			($diff %60),
 			#print "entry=[$entry]\n";
 			#print "whenstr=[",$entry->{whenstr},"]\n";
-			$txt .= sprintf(" %s\n",$entry->{rest});
+			$txt .= sprintf(" %s %s\n",$entry->{whenstr}, $entry->{rest});
 			#$txt .= "\n" . $entry->{record} . ":" . $entry->{every} . ":" . $entry->{input} . "\n";
 			$found++;
 			}
@@ -321,12 +330,12 @@ sub do_mail
 	    : $found==1 ?	"$found reminder for $today"
 	    :			"$found reminders to $today" );
 
-	if( $ARGS{verbosity} )
+	if( $mode eq "show" )
 	    {
 	    print "Debug Mail -s '$subject' $address\n",
 	        ( $txt ? $txt : "$subject\n" );
 	    }
-	elsif( 1 )
+	elsif( $mode eq "mail" )
 	    {
 	    &sendmail( $FROM, $address, $subject, $txt );
 	    }
@@ -437,7 +446,7 @@ sub calendar
     foreach $address ( sort keys %entries )
 	{
 	my($cyear,$cmonth,$cmday,$chour,$cmin,$csec,$wday)
-	    = ( $tyear, $tmonth, $tmday );
+	    = ( $tyear, $tmonth, $tmday, $thour, $tmin, $tmday );
 	    #= epoch_to_ymd($start_at{$address});
 #	printf("ymd($start_at{$address}}=%04d-%02d-%02d %02d:%02d:%02d %d.\n",
 #	    $cyear, $cmonth, $cmday, $chour, $cmin, $csec, $wday );
@@ -547,7 +556,6 @@ sub userpage_handler
 	close( REM );
 	}
 
-    &read_remind_file();
     my $toprint = <<EOF . &calendar() . "</center>";
 <script>
 
@@ -638,7 +646,7 @@ if( $ENV{SCRIPT_NAME} || $ARGS{mode} eq "html" )
     { &userpage_handler(); }
 elsif( $ARGS{mode} eq "sort" )
     { &do_sort(); }
-else
-    { do_mail(); }
+elsif( &inlist($ARGS{mode},"mail","show") )
+    { &generate_message( $ARGS{mode} ); }
 
 exit($exit_stat);
