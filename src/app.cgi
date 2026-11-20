@@ -30,15 +30,15 @@
 ########################################################################
 #doc#	remind - Send e-mail reminders based on user's .remind
 #doc#	Invoked once a day in the wee hours of the morning.
+#doc#	Web allows you to review and update schedule.
 ########################################################################
-#doc##Remind - Software to send e-mail reminders according to dated entries
 
 use strict;
 use Date::Manip;
 
 use lib "/usr/local/lib/perl";
 use cpi_vars;
-use cpi_file qw( fatal echodo read_lines write_lines );
+use cpi_file qw( fatal echodo read_lines write_lines append_file cleanup );
 use cpi_arguments qw( parse_arguments );
 use cpi_send_file qw( sendmail );
 use cpi_time qw( parsedate revlocaltime time_string );
@@ -48,40 +48,44 @@ use cpi_user qw( logout_select );
 use cpi_setup qw( setup );
 use cpi_inlist qw( inlist );
 
-$| = 1;
+#print "Content-type:  text/html\n\n";
+$| =	1;
 
 &setup( stderr=>"Sched" );
 
 # Put constants here
 
-my @MAIL_TYPES = ( "Non recurring", "Recurring" );
+my @MAIL_TYPES =	( "Non recurring", "Recurring" );
 my %MAIL_ON_DAYS =
     (
     "Non recurring"	=> [ 0, 1, 2, 7, 14, 30, 60 ],
     "Recurring"		=> [ 0, 1, 2, 7 ]
     );
-my $DAY_IN_SECONDS	= ( 60 * 60 * 24 );
-#my $FROM		= "reminder\@brightsands.com";
-my $FROM		= "chris";
+my $DAY_IN_SECONDS	=	( 60 * 60 * 24 );
+#my $FROM		=	"reminder\@brightsands.com";
+my $FROM		=	"chris";
 
-my $SENDMAIL		= "/usr/lib/sendmail";
-my $MAIL		= "/usr/bin/Mail";
-my $SECONDS_PER_DAY	= 86400;
-my $FORM_NAME		= "form";
+my $SENDMAIL		=	"/usr/lib/sendmail";
+my $MAIL		=	"/usr/bin/Mail";
+my $SECONDS_PER_DAY	=	86400;
+my $FORM_NAME		=	"form";
+
+my $UnixDateOffset	=	18000;
+my $TMP			=	"/tmp/$cpi_vars::PROG.tmp";
 
 my $address;
 my %entries;
 #my ($tsec,$tmin,$thour,$tmday,$tmonth,$tyear,$twday);
 my ($tyear,$tmonth,$tmday,$thour,$tmin,$tsec,$twday);
-my $UnixDateOffset	= 18000;
 my %start_at;
 my %stop_at;
 
-our %ONLY_ONE_DEFAULTS =
+our %ONLY_ONE_DEFAULTS	=
     (
     "datetime"		=>	time(),
-    "file"		=>	"$cpi_vars::BASEDIR/lib/remind.txt",
-    "newfile"		=>	"$cpi_vars::BASEDIR/lib/remind.new",
+    "file"		=>	$cpi_vars::BASEDIR."/lib/remind.txt",
+    "backups"		=>	$cpi_vars::BASEDIR."/lib/bups",
+    "newfile"		=>	$cpi_vars::BASEDIR."/lib/remind.new",
     "mode"		=>	[ "show", "mail", "sort", "html" ],
     "show"		=>	{ "alias"=>["-mode=show"] },
     "mail"		=>	{ "alias"=>["-mode=mail"] },
@@ -272,8 +276,11 @@ sub read_remind_file
 sub generate_message
     {
     my( $mode ) = @_;
+    my $now = $ARGS{datetime};
     #my $now_day = $ARGS{datetime} - ($ARGS{datetime} % $DAY_IN_SECONDS);
     my $now_day = $ARGS{datetime};
+
+    &read_remind_file();
     print "generate_message now_day="
         .&time_string("%04d-%02d-%02d %02d:%02d:%02d.%d.\n",$now_day)
 	if( $ARGS{verbosity} > 1 );
@@ -377,23 +384,35 @@ MAILEOF
 sub do_sort
     {
     my @toprint;
+
     foreach $address ( sort keys %entries )
         {
 	push( @toprint, $address );
 	foreach my $ep ( sort { $a->{whenstr} cmp $b->{whenstr} }
-	    grep( ! $_->{interpolated}, @{$entries{$address}{all}} ) )
+	    grep( ! $_->{interpolated} && $_->{rest},
+		@{$entries{$address}{all}} ) )
 	    {
 	    push( @toprint, $ep->{whenstr} . " " . $ep->{rest} );
 	    }
 	}
 
-    &write_lines( $ARGS{newfile}, @toprint );
+    if( $ARGS{mdoe} eq "sort" )
+        { &write_lines( $ARGS{newfile}, @toprint ); }
+    else
+        {
+        my $bup = &time_string("%04d-%02d-%02d:%02d:%02d:%02d.bz2",time());
+	&echodo( "bzip2 -9 < $ARGS{file} > $ARGS{backups}/$bup" );
+	&write_lines( $ARGS{file}, @toprint );
+	}
 
-    print "size of $ARGS{file} = ", -s $ARGS{file}, ".\n";
-    print "size of $ARGS{newfile} = ", -s $ARGS{newfile}, ".\n";
-    &fatal("Sorting from $ARGS{newfile} to $ARGS{file} caused a corruption.")
-        if( -s $ARGS{file} != -s $ARGS{newfile} );
-    #&echodo("cat '$ARGS{newfile}' > '$ARGS{file}' && rm -f '$ARGS{newfile}'");
+    if( $ARGS{verbosity} )
+	{	# This will not happen with web app
+	print "size of $ARGS{file} = ", -s $ARGS{file}, ".\n";
+	print "size of $ARGS{newfile} = ", -s $ARGS{newfile}, ".\n";
+	}
+#    &fatal("Sorting from $ARGS{newfile} to $ARGS{file} caused a corruption.")
+#        if( -s $ARGS{file} != -s $ARGS{newfile} );
+#    &echodo("cat '$ARGS{newfile}' > '$ARGS{file}' && rm -f '$ARGS{newfile}'");
     }
 
 #########################################################################
@@ -440,13 +459,27 @@ sub calendar
         join( "", map { "<th>XL(${_}day)</th>" }
 	    ("Sun","Mon","Tues","Wednes","Thurs","Fri","Satur") ) );
     
-    my $now = time();
-    my($tyear,$tmonth,$tmday) = &epoch_to_ymd($now);
+    #my $now = time();
+    #my($tyear,$tmonth,$tmday) = &epoch_to_ymd($now);
 
     foreach $address ( sort keys %entries )
 	{
 	my($cyear,$cmonth,$cmday,$chour,$cmin,$csec,$wday)
 	    = ( $tyear, $tmonth, $tmday, $thour, $tmin, $tmday );
+	if( $here )
+	    {
+	    if( $here =~ m:^(\d\d\d\d)-(\d+)-(\d+)$: )
+	        { $tyear=$1; $tmonth=$2; $tmday=$3; }
+	    elsif( $here =~ m:^([01]\d)/([0123]\d)/(\d\d\d\d)$: )
+	        { $tyear=$3; $tmonth=$1; $tmday=$2; }
+	    elsif( $here =~ m:^([0123]\d)/([01]\d)/(\d\d\d\d)$: )
+	        { $tyear=$3; $tmonth=$1; $tmday=$2; }
+	    elsif( $here =~ m:^([01]\d)/([0123]\d)/(\d\d)$: )
+	        { $tyear=$3+2000; $tmonth=$1; $tmday=$2; }
+	    elsif( $here =~ m:^([0123]\d)/([01]\d)/(\d\d)$: )
+	        { $tyear=$3+2000; $tmonth=$1; $tmday=$2; }
+	    $cyear=$tyear; $cmonth=$tmonth; $cmday=$tmday;
+	    }
 	    #= epoch_to_ymd($start_at{$address});
 #	printf("ymd($start_at{$address}}=%04d-%02d-%02d %02d:%02d:%02d %d.\n",
 #	    $cyear, $cmonth, $cmday, $chour, $cmin, $csec, $wday );
@@ -472,7 +505,7 @@ sub calendar
 
 	    if( $is_today )
 		{ $col = sprintf("#%02x%02x%02x",0xff,$green,0xb0); }
-	    elsif( $timeind < $now )
+	    elsif( $timeind < $ARGS{datetime} )
 		{ $col = sprintf("#%02x%02x%02x",0xb0,$green,0xb0); }
 	    else
 		{ $col = sprintf("#%02x%02x%02x",0xc0,$green,0xff); }
@@ -494,13 +527,11 @@ sub calendar
 		foreach my $entry (
 		    sort {$a->{hhmm} cmp $b->{hhmm}} @entries_today )
 		    {
-		    my $text = "something";
 		    push( @toprint, "<br>",
 			( $entry->{hhmm} ? $entry->{hhmm}." " : "* " ),
-			"<a href='javascript:window.document.$FORM_NAME.key.value",
-			"=$text;window.document.$FORM_NAME.submit();'>",
+			"<a href='javascript:get_an_entry(\"$datetext\",\"$entry->{rest}\");'>",
 			$entry->{rest},
-			"</a>" );
+			"</a>" ) if( $entry->{rest} );
 		    }
 		}
 	    push( @toprint, "</td>" );
@@ -511,8 +542,12 @@ sub calendar
 		= &epoch_to_ymd($timeind);
 	    } while( $timeind<=$stop_at{$address} || $cmonth==$check_month );
 	}
-    push( @toprint, "</tr></table>\n" );
-    print STDERR "Returning [",@toprint,"]\n";
+    push( @toprint, "</tr>\n<tr><th colspan=7>",
+	"<input type=text name=here value='",
+	$cpi_vars::FORM{here},
+	"' size=10>",
+	"</th></tr></table></form>\n" );
+    #print STDERR "Returning [",@toprint,"]\n";
     return join("",@toprint);
     }
 
@@ -548,27 +583,54 @@ sub footer()
 #########################################################################
 sub userpage_handler
     {
-    if( $cpi_vars::FORM{new_entry} && $cpi_vars::FORM{here} )
+    $cpi_vars::FORM{here} ||= &time_string("%04d-%02d-%02d");
+    $cpi_vars::FORM{new_entry} ||= "";
+    $cpi_vars::FORM{old_entry} ||= "";
+    if( $cpi_vars::FORM{new_entry} && ! $cpi_vars::FORM{old_entry} )
         {
-	open( REM, ">> $ARGS{file}" ) ||
-	    &fatal("Cannot append to $ARGS{file}:  $!");
-	print REM $cpi_vars::FORM{here}, " ", $cpi_vars::FORM{new_entry}, "\n";
-	close( REM );
+	&append_file( $ARGS{file},
+	    sprintf("%10s %s\n",
+		$cpi_vars::FORM{here}, $cpi_vars::FORM{new_entry} ) );
+	&read_remind_file();
+	}
+    else
+        {
+	&read_remind_file();
+	if( $cpi_vars::FORM{new_entry} ne $cpi_vars::FORM{old_entry} )
+	    {
+	    foreach my $entry (
+		&matching_entries($address,split(/-/,$cpi_vars::FORM{here}) ) )
+		{
+		$entry->{rest} = $cpi_vars::FORM{new_entry}
+		    if( $entry->{rest} eq $cpi_vars::FORM{old_entry} );
+		}
+	    &do_sort();	# Write out the now modified data
+	    }
 	}
 
     my $toprint = <<EOF . &calendar() . "</center>";
 <script>
 
 //////////////////////////////////////////////////////////////////////////
+//	User wants to change or add an entry.				//
 //////////////////////////////////////////////////////////////////////////
-function get_an_entry( datestr )
+function get_an_entry( datestr, old_entry )
     {
     with ( window.document )
         {
-	$FORM_NAME.new_entry.value
-	    = prompt("XL(Enter hh:mm entry for) "+datestr);
-	$FORM_NAME.here.value = datestr;
-	$FORM_NAME.submit();
+	var prompt_val = "XL(Enter hh:mm entry for) "+datestr;
+	var new_value =
+	    ( typeof old_entry === 'undefined'
+	    ? prompt(prompt_val)
+	    : prompt(prompt_val,old_entry) );
+	if( new_value !== null )
+	    {
+	    $FORM_NAME.here.value = datestr;
+	    $FORM_NAME.new_entry.value = new_value;
+	    $FORM_NAME.old_entry.value =
+		( typeof old_entry === 'undefined' ? "" : old_entry );
+	    $FORM_NAME.submit();
+	    }
 	}
     }
 </script>
@@ -579,8 +641,8 @@ $cpi_vars::HELP_IFRAME
 <input type=hidden name=SID value=$cpi_vars::FORM{SID}>
 <input type=hidden name=USER value=$cpi_vars::USER>
 <input type=hidden name=func value=Update>
-<input type=hidden name=here>
 <input type=hidden name=new_entry>
+<input type=hidden name=old_entry>
 <center>
 EOF
     &xprint( $toprint );
@@ -640,12 +702,11 @@ $today =~ s/( \d\d\d\d)/,$1/;
 $today = sprintf("%04d-%02d-%02d",$tyear,$tmonth,$tmday);
 print "today=[$today]\n" if( $ARGS{verbosity} );
 
-&read_remind_file();
 
 if( $ENV{SCRIPT_NAME} || $ARGS{mode} eq "html" )
     { &userpage_handler(); }
 elsif( $ARGS{mode} eq "sort" )
-    { &do_sort(); }
+    { &read_remind_file(); &do_sort(); }
 elsif( &inlist($ARGS{mode},"mail","show") )
     { &generate_message( $ARGS{mode} ); }
 
