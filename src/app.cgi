@@ -37,8 +37,8 @@ use strict;
 use Date::Manip;
 
 use lib "/usr/local/lib/perl";
-use cpi_vars;
-use cpi_file qw( fatal echodo read_lines write_lines append_file cleanup );
+use cpi_file qw( fatal echodo read_lines write_lines append_file
+		    files_in cleanup );
 use cpi_arguments qw( parse_arguments );
 use cpi_send_file qw( sendmail );
 use cpi_time qw( parsedate revlocaltime time_string );
@@ -47,6 +47,12 @@ use cpi_cgi qw( CGIreceive CGIheader );
 use cpi_user qw( logout_select );
 use cpi_setup qw( setup );
 use cpi_inlist qw( inlist );
+use cpi_db qw( dbget );
+use cpi_trace qw( stack_trace );
+
+use Data::Dumper;
+
+package main;
 
 #print "Content-type:  text/html\n\n";
 $| =	1;
@@ -55,7 +61,6 @@ $| =	1;
 
 # Put constants here
 
-my @MAIL_TYPES =	( "Non recurring", "Recurring" );
 my %MAIL_ON_DAYS =
     (
     "Non recurring"	=> [ 0, 1, 2, 7, 14, 30, 60 ],
@@ -73,9 +78,7 @@ my $FORM_NAME		=	"form";
 my $UnixDateOffset	=	18000;
 my $TMP			=	"/tmp/$cpi_vars::PROG.tmp";
 
-my $address;
 my %entries;
-#my ($tsec,$tmin,$thour,$tmday,$tmonth,$tyear,$twday);
 my ($tyear,$tmonth,$tmday,$thour,$tmin,$tsec,$twday);
 my %start_at;
 my %stop_at;
@@ -83,9 +86,11 @@ my %stop_at;
 our %ONLY_ONE_DEFAULTS	=
     (
     "datetime"		=>	time(),
-    "file"		=>	$cpi_vars::BASEDIR."/lib/remind.txt",
+    "source"		=>	"",
+    "directory"		=>	$cpi_vars::BASEDIR."/schedules",
     "backups"		=>	$cpi_vars::BASEDIR."/lib/bups",
     "newfile"		=>	$cpi_vars::BASEDIR."/lib/remind.new",
+    "users"		=>	"all",
     "mode"		=>	[ "show", "mail", "sort", "html" ],
     "show"		=>	{ "alias"=>["-mode=show"] },
     "mail"		=>	{ "alias"=>["-mode=mail"] },
@@ -120,6 +125,20 @@ sub usage
     }
 
 #########################################################################
+#########################################################################
+sub sanity
+    {
+    my( $msg ) = @_;
+    my @yearps= @{$entries{"chris.interim\@gmail.com"}{year}{2026}};
+    print "year ",( map{$_->{record}} grep( $_->{rest}=~/SEARCHFOR/, @yearps )), ".\n";
+    my @monps= @{$entries{"chris.interim\@gmail.com"}{mon}{11}};
+    print "mon ",( map{$_->{record}} grep( $_->{rest}=~/SEARCHFOR/, @monps )), ".\n";
+    my @dayps= @{$entries{"chris.interim\@gmail.com"}{day}{1}};
+    print "day ",( map{$_->{record}} grep( $_->{rest}=~/SEARCHFOR/, @dayps )), ".\n";
+    print "[$msg] nyear=",scalar(@yearps)," nmon=",scalar(@monps)," nday=",scalar(@dayps),".\n";
+    }
+
+#########################################################################
 #	Return list of entries that match specified date		#
 #########################################################################
 sub matching_entries
@@ -150,6 +169,17 @@ sub epoch_to_ymd
     }
 
 #########################################################################
+#	Return a list of schedules to process.				#
+#########################################################################
+sub schedule_list
+    {
+    if( ! $ARGS{users} || $ARGS{users} eq "all" )
+        { return &files_in( $ARGS{directory},".*@.*" ); }
+    else
+        { return split(/\s*,\s*/,$ARGS{users}); }
+    }
+
+#########################################################################
 #	Return pointer to struct with calendar entry			#
 #########################################################################
 sub make_entry
@@ -159,7 +189,7 @@ sub make_entry
     my $whenstr = $ymd
 	. ( $every > 0 ? sprintf(":%-3d",$every) : "    " )
 	. ( $hhmm ? sprintf(" %s",$hhmm) : "      " );
-    #print "cmc whenstr=[$whenstr]\n";
+    #print "cmc whenstr=[$whenstr] [$rest]\n";
     my $entry =
 	{
 	"record"	=> $record_number,
@@ -176,9 +206,123 @@ sub make_entry
     push( @{$entries{$address}{all}}, $entry );
     push( @all_records, $entry );
     $record_number++;
-    printf( "%d %s %s %s\n", $entry->{record}, $entry->{whenstr}, $entry, $entry->{rest} )
+    printf( "%s %d %s %s %s\n", $address, $entry->{record}, $entry->{whenstr}, $entry, $entry->{rest} )
 	if( $ARGS{verbosity} > 1 );
     return $entry;
+    }
+
+#########################################################################
+#	Parse a line from remind file or from web form.  Return pointer	#
+#	to new entry if it was real or undef if we don't recognize it.	#
+#########################################################################
+sub parse_entry
+    {
+    my( $address, $entry_text ) = @_;
+    my( $mon, $day, $yr, $every, $rest );
+    if( $entry_text =~ m~^(\d\d\d\d)-(\d\d*)-(\d\d*):(\d+)\s*(.*?)$~ ||
+	$entry_text =~ m~^(\d\d\d\d|\*)-(\d\d*|\*)-(\d\d*|\*)(\s*)(.*?)$~ )
+	{ ($yr,$mon,$day,$every,$rest) = ($1,$2,$3,$4,$5); }
+    elsif( $entry_text =~ m~^(\d+)/(\d+)/(\d+):(\d+)\s*(.*)$~ ||
+	$entry_text =~ m~^(\d+|\*)/(\d+|\*)/(\d+|\*)(\s+)(.*)$~	)
+	{ ($mon,$day,$yr,$every,$rest) = ($1,$2,$3,$4,$5); }
+    else
+        { return undef; }
+
+    my $hhmm = "";
+    $every = ( $every =~ /\d/ ? $every+0 : 0 );
+
+    $yr = 0 if( $yr eq "*" );
+    $mon = 0 if( $mon eq "*" );
+    $day = 0 if( $day eq "*" );
+    
+    if( $rest =~ /^(\d+):(\d+)\s*(.*)/ )
+	{
+	$hhmm = sprintf("%02d:%02d",$1,$2);
+	$rest = $3;
+	}
+
+    $yr += 2000 if( $yr && $yr < 100 );
+
+    my $from_epoch;
+    if( grep( ! $_, $yr, $mon, $day ) )
+	{ $every = -1; }
+    else
+	{ $from_epoch = &parsedate("$yr-$mon-$day"); }
+
+    my $entry =
+	&make_entry($address,$yr,$mon,$day,$hhmm,$from_epoch,$every,$rest);
+    $entry->{input} = $entry_text;
+    my @current_entries = ( $entry );
+
+    if( $every >= 0 )	# Not for wildcards
+	{
+	if( $every > 0 )
+	    {
+	    my $check_year = $yr + 30;
+	    my $xind = 0;
+	    while( $yr < $check_year )
+		{
+		$from_epoch += $DAY_IN_SECONDS * $every;
+		($yr,$mon,$day) = epoch_to_ymd($from_epoch);
+		my $e =
+		    &make_entry(
+			$address,$yr,$mon,$day,$hhmm,$from_epoch,$every,$rest);
+		push( @current_entries, $e );
+		$e->{interpolated} = 1;
+		#$e->{input} = (++$xind)."[$input]";
+		}
+	    }
+	elsif( ! $start_at{$address} )
+	    {
+	    $start_at{$address} = $stop_at{$address}
+		= $from_epoch;
+	    }
+	elsif( $from_epoch < $start_at{$address} )
+	    { $start_at{$address} = $from_epoch; }
+	elsif( $from_epoch > $stop_at{$address} )
+	    { $stop_at{$address} = $from_epoch; }
+	}
+    return @current_entries;
+    }
+
+#########################################################################
+#	Determine names from arguments.					#
+#########################################################################
+sub user_address_file
+    {
+    $| = 1;
+    my %uaf = ();
+
+    foreach my $arg ( @_ )
+        {
+	if( $arg =~ /\// )
+	    { $uaf{file} = $arg; }
+	elsif( $arg =~ /@/ )
+	    { $uaf{address} = $arg; }
+	else
+	    { $uaf{user} = $arg; }
+	}
+
+    $uaf{user} = $cpi_vars::USER if( (!defined($uaf{user})) && $cpi_vars::USER );
+
+    if( ! defined($uaf{address}) )
+	{
+	if( $uaf{user} )
+	    {
+	    $uaf{address} =
+		&dbget($cpi_vars::ACCOUNTDB,"users",$uaf{user},"email");
+	    }
+	elsif( $uaf{file} )
+	    {
+	    $uaf{address} = $uaf{file};
+	    $uaf{address} =~ s+.*/++;
+	    }
+	}
+
+    $uaf{file} = "$ARGS{directory}/$uaf{address}" if(!$uaf{file});
+    #print STDERR "End uaf...<br>\n", (map {"k($_)=$uaf{$_}.<br>\n"} keys %uaf );
+
+    return %uaf;
     }
 
 #########################################################################
@@ -186,80 +330,18 @@ sub make_entry
 #########################################################################
 sub read_remind_file
     {
+    my %uaf = &user_address_file( @_ );
     my @current_entries;
-    foreach $_ ( &read_lines( $ARGS{file} ) )
+
+    foreach my $input ( &read_lines( $uaf{file} ) )
 	{
-	next if( $_ eq "" );
-	my $input = $_;
-	if( /^[^\s@]+@[\w\.]+\.\w+$/ )
-	    { $address = $_; }
-	else
+	if( defined($input) and $input ne "" )
 	    {
-	    my( $mon, $day, $yr, $every, $rest );
-	    if( m~^(\d\d\d\d)-(\d\d*)-(\d\d*):(\d+)\s*(.*?)$~		||
-	        m~^(\d\d\d\d|\*)-(\d\d*|\*)-(\d\d*|\*)(\s*)(.*?)$~	)
-		{ ($yr,$mon,$day,$every,$rest) = ($1,$2,$3,$4,$5); }
-	    elsif(  m~^(\d+)/(\d+)/(\d+):(\d+)\s*(.*)$~		||
-		m~^(\d+|\*)/(\d+|\*)/(\d+|\*)(\s+)(.*)$~	)
-		{ ($mon,$day,$yr,$every,$rest) = ($1,$2,$3,$4,$5); }
-	    if( defined($yr) )
-		{
-		my $to_print = $input;
-		my $hhmm = "";
-		$every = ( $every =~ /\d/ ? $every+0 : 0 );
-
-		$yr = 0 if( $yr eq "*" );
-		$mon = 0 if( $mon eq "*" );
-		$day = 0 if( $day eq "*" );
-	        
-		if( $rest =~ /^(\d+):(\d+)\s*(.*)/ )
-		    {
-		    $hhmm = sprintf("%02d:%02d",$1,$2);
-		    $rest = $3;
-		    }
-
-		$yr += 2000 if( $yr && $yr < 100 );
-
-		my $from_epoch;
-		if( grep( ! $_, $yr, $mon, $day ) )
-		    { $every = -1; }
-		else
-		    { $from_epoch = &parsedate("$yr-$mon-$day"); }
-
-		my $entry =
-		    &make_entry($address,$yr,$mon,$day,$hhmm,$from_epoch,$every,$rest);
-		$entry->{input} = $input;
-		@current_entries = ( $entry );
-
-		if( $every >= 0 )	# Not for wildcards
-		    {
-		    if( $every > 0 )
-			{
-			my $check_year = $yr + 30;
-			my $xind = 0;
-			while( $yr < $check_year )
-			    {
-			    $from_epoch += $DAY_IN_SECONDS * $every;
-			    ($yr,$mon,$day) = epoch_to_ymd($from_epoch);
-			    my $e =
-				&make_entry(
-				    $address,$yr,$mon,$day,$hhmm,$from_epoch,$every,$rest);
-			    push( @current_entries, $e );
-			    $e->{interpolated} = 1;
-			    #$e->{input} = (++$xind)."[$input]";
-			    }
-			}
-		    elsif( ! $start_at{$address} )
-		        {
-			$start_at{$address} = $stop_at{$address}
-			    = $from_epoch;
-			}
-		    elsif( $from_epoch < $start_at{$address} )
-		        { $start_at{$address} = $from_epoch; }
-		    elsif( $from_epoch > $stop_at{$address} )
-		        { $stop_at{$address} = $from_epoch; }
-		    }
-		}
+	    my @new_entries;
+	    if( $input =~ /^[^\s@]+@[\w\.]+\.\w+$/ )
+		{ $uaf{address} = $input; }
+	    elsif( @new_entries = &parse_entry( $uaf{address}, $input ) )
+		{ @current_entries = @new_entries; }
 	    elsif( @current_entries )
 		{
 		grep( $_->{rest}.=$input, @current_entries );
@@ -268,6 +350,7 @@ sub read_remind_file
 		{ print "'$input' not connected to an entry.  Skipping.\n"; }
 	    }
 	}
+    #print "remind:\n", Dumper(\%entries), "\n";
     }
 
 #########################################################################
@@ -275,106 +358,103 @@ sub read_remind_file
 #########################################################################
 sub generate_message
     {
-    my( $mode ) = @_;
+    my( $mode, @rest ) = @_;
+    my %uaf = &user_address_file( @rest );
+    &read_remind_file( @rest );
     my $now = $ARGS{datetime};
     #my $now_day = $ARGS{datetime} - ($ARGS{datetime} % $DAY_IN_SECONDS);
     my $now_day = $ARGS{datetime};
 
-    &read_remind_file();
     print "generate_message now_day="
         .&time_string("%04d-%02d-%02d %02d:%02d:%02d.%d.\n",$now_day)
 	if( $ARGS{verbosity} > 1 );
 
-    my %day_flags;
-    foreach my $daytype ( @MAIL_TYPES )
-	{ grep( $day_flags{$_}{$daytype}=1, @{$MAIL_ON_DAYS{$daytype}} ); }
-
-    foreach $address ( sort keys %entries )
+    my $address = $uaf{address};
+    my $last_header = "";
+    my $txt = "";
+    my $found = 0;
+    foreach my $entry_type (
+	sort {scalar(@{$MAIL_ON_DAYS{$a}}) <=> scalar(@{$MAIL_ON_DAYS{$b}}) }
+	    keys %MAIL_ON_DAYS)
 	{
-	my $last_header = "";
-	my $txt = "";
-	my $found = 0;
-	foreach my $entry_type ( @MAIL_TYPES )
+	foreach my $offset ( @{$MAIL_ON_DAYS{$entry_type}} )
 	    {
-	    foreach my $offset ( @{$MAIL_ON_DAYS{$entry_type}} )
+	    #$txt .= "Looking at offset=$offset entry_type=$entry_type\n";
+	    my $hdr = "\n$entry_type events " .
+		( $offset <= 0 ? "today"
+		: $offset <= 1 ? "tomorrow"
+		: "in $offset days" ) . ":\n";
+	    my( $cyear, $cmonth, $cmday ) =
+		&epoch_to_ymd($now_day + $offset*$DAY_IN_SECONDS);
+	    #$txt .= sprintf( "CMC ymd=%04d-%02d-%02d\n",$cyear,$cmonth,$cmday);
+	    foreach my $entry (
+		sort {$a->{hhmm} cmp $b->{hhmm}}
+		&matching_entries($uaf{address},$cyear,$cmonth,$cmday) )
 		{
-		#$txt .= "Looking at offset=$offset entry_type=$entry_type\n";
-		my $hdr = "\n$entry_type events " .
-		    ( $offset <= 0 ? "today"
-		    : $offset <= 1 ? "tomorrow"
-		    : "in $offset days" ) . ":\n";
-		my( $cyear, $cmonth, $cmday ) =
-		    &epoch_to_ymd($now_day + $offset*$DAY_IN_SECONDS);
-		#$txt .= sprintf( "CMC ymd=%04d-%02d-%02d\n",$cyear,$cmonth,$cmday);
-		foreach my $entry (
-		    sort {$a->{hhmm} cmp $b->{hhmm}}
-		    &matching_entries($address,$cyear,$cmonth,$cmday) )
+		if( $entry_type eq $entry->{type} )
 		    {
-		    if( $entry_type eq $entry->{type} )
+		    if( $hdr ne $last_header )
 			{
-			if( $hdr ne $last_header )
-			    {
-			    $txt .= $hdr;
-			    $last_header = $hdr;
-			    }
-    #		    $txt .= sprintf("%d-%02d:%02d:%02d %s",
-    #			$diff/$DAY_IN_SECONDS,
-    #			($diff % $DAY_IN_SECONDS) / 3600,
-    #			($diff % 3600) / 60,
-    #			($diff %60),
-			#print "entry=[$entry]\n";
-			#print "whenstr=[",$entry->{whenstr},"]\n";
-			$txt .= sprintf(" %s %s\n",$entry->{whenstr}, $entry->{rest});
-			#$txt .= "\n" . $entry->{record} . ":" . $entry->{every} . ":" . $entry->{input} . "\n";
-			$found++;
+			$txt .= $hdr;
+			$last_header = $hdr;
 			}
+#		    $txt .= sprintf("%d-%02d:%02d:%02d %s",
+#			$diff/$DAY_IN_SECONDS,
+#			($diff % $DAY_IN_SECONDS) / 3600,
+#			($diff % 3600) / 60,
+#			($diff %60),
+		    #print "entry=[$entry]\n";
+		    #print "whenstr=[",$entry->{whenstr},"]\n";
+		    $txt .= sprintf(" %s %s\n",$entry->{whenstr}, $entry->{rest});
+		    #$txt .= "\n" . $entry->{record} . ":" . $entry->{every} . ":" . $entry->{input} . "\n";
+		    $found++;
 		    }
 		}
 	    }
+	}
 
-	my $subject =
-	    ( $found<=0 ?	"NO reminders for $today"
-	    : $found==1 ?	"$found reminder for $today"
-	    :			"$found reminders to $today" );
+    my $subject =
+	( $found<=0 ?	"NO reminders for $today"
+	: $found==1 ?	"$found reminder for $today"
+	:			"$found reminders to $today" );
 
-	if( $mode eq "show" )
+    if( $mode eq "show" )
+	{
+	print "Debug Mail -s '$subject' $uaf{address}\n",
+	    ( $txt ? $txt : "$subject\n" );
+	}
+    elsif( $mode eq "mail" )
+	{
+	&sendmail( $FROM, $uaf{address}, $subject, $txt );
+	}
+    elsif( $MAIL )
+	{
+	#print "Mail subject=[$subject] address=[$uaf{address}]\n";
+	open(OUT, "|Mail -s '$subject' $uaf{address}")
+	    || die("Cannot run ${MAIL}:  $!");
+	print OUT ( $txt ? $txt : "$subject\n" );
+	close( OUT );
+	}
+    elsif( $SENDMAIL )
+	{
+	#print "Sendmail logic.\n";
+	if( $FROM )
 	    {
-	    print "Debug Mail -s '$subject' $address\n",
-	        ( $txt ? $txt : "$subject\n" );
+	    open(OUT, "| $SENDMAIL -t -f $FROM" )
+		|| die("Cannot run ${SENDMAIL}:  $!");
 	    }
-	elsif( $mode eq "mail" )
+	else
 	    {
-	    &sendmail( $FROM, $address, $subject, $txt );
+	    open(OUT, "| $SENDMAIL -t" )
+		|| die("Cannot run ${SENDMAIL}:  $!");
 	    }
-	elsif( $MAIL )
-	    {
-	    #print "Mail subject=[$subject] address=[$address]\n";
-	    open(OUT, "|Mail -s '$subject' $address")
-		|| die("Cannot run ${MAIL}:  $!");
-	    print OUT ( $txt ? $txt : "$subject\n" );
-	    close( OUT );
-	    }
-	elsif( $SENDMAIL )
-	    {
-	    #print "Sendmail logic.\n";
-	    if( $FROM )
-		{
-		open(OUT, "| $SENDMAIL -t -f $FROM" )
-		    || die("Cannot run ${SENDMAIL}:  $!");
-		}
-	    else
-		{
-		open(OUT, "| $SENDMAIL -t" )
-		    || die("Cannot run ${SENDMAIL}:  $!");
-		}
-	    print OUT <<MAILEOF;
-To:  $address
+	print OUT <<MAILEOF;
+To:  $uaf{address}
 Subject:  $subject
 
 $txt
 MAILEOF
-	    close(OUT);
-	    }
+	close(OUT);
 	}
     }
 
@@ -383,31 +463,29 @@ MAILEOF
 #########################################################################
 sub do_sort
     {
-    my @toprint;
+    my %uaf = &user_address_file(@_);
 
-    foreach $address ( sort keys %entries )
-        {
-	push( @toprint, $address );
-	foreach my $ep ( sort { $a->{whenstr} cmp $b->{whenstr} }
-	    grep( ! $_->{interpolated} && $_->{rest},
-		@{$entries{$address}{all}} ) )
-	    {
-	    push( @toprint, $ep->{whenstr} . " " . $ep->{rest} );
-	    }
+    my @toprint = ( $uaf{address} );
+
+    foreach my $ep ( sort { $a->{whenstr} cmp $b->{whenstr} }
+	grep( ! $_->{interpolated} && $_->{rest},
+	    @{$entries{$uaf{address}}{all}} ) )
+	{
+	push( @toprint, $ep->{whenstr} . " " . $ep->{rest} );
 	}
 
-    if( $ARGS{mdoe} eq "sort" )
+    if( $ARGS{mode} eq "sort" )
         { &write_lines( $ARGS{newfile}, @toprint ); }
     else
         {
         my $bup = &time_string("%04d-%02d-%02d:%02d:%02d:%02d.bz2",time());
-	&echodo( "bzip2 -9 < $ARGS{file} > $ARGS{backups}/$bup" );
-	&write_lines( $ARGS{file}, @toprint );
+	&echodo( "bzip2 -9 < $uaf{file} > $ARGS{backups}/$bup" );
+	&write_lines( $uaf{file}, @toprint );
 	}
 
     if( $ARGS{verbosity} )
 	{	# This will not happen with web app
-	print "size of $ARGS{file} = ", -s $ARGS{file}, ".\n";
+	print "size of $uaf{file} = ", -s $uaf{file}, ".\n";
 	print "size of $ARGS{newfile} = ", -s $ARGS{newfile}, ".\n";
 	}
 #    &fatal("Sorting from $ARGS{newfile} to $ARGS{file} caused a corruption.")
@@ -451,6 +529,7 @@ sub calendar
     {
     my( $need_header, $fieldp, @klist ) = @_;
     my $here = $cpi_vars::FORM{here};
+    my %uaf = &user_address_file();
 
     &setup_time_report(@klist);
     #my( $start_at, $stop_at ) = &setup_time_report(@klist);
@@ -462,7 +541,7 @@ sub calendar
     #my $now = time();
     #my($tyear,$tmonth,$tmday) = &epoch_to_ymd($now);
 
-    foreach $address ( sort keys %entries )
+    foreach my $address ( $uaf{address} )
 	{
 	my($cyear,$cmonth,$cmday,$chour,$cmin,$csec,$wday)
 	    = ( $tyear, $tmonth, $tmday, $thour, $tmin, $tmday );
@@ -480,8 +559,8 @@ sub calendar
 	        { $tyear=$3+2000; $tmonth=$1; $tmday=$2; }
 	    $cyear=$tyear; $cmonth=$tmonth; $cmday=$tmday;
 	    }
-	    #= epoch_to_ymd($start_at{$address});
-#	printf("ymd($start_at{$address}}=%04d-%02d-%02d %02d:%02d:%02d %d.\n",
+	    #= epoch_to_ymd($start_at{$uaf{address}});
+#	printf("ymd($start_at{$uaf{address}}}=%04d-%02d-%02d %02d:%02d:%02d %d.\n",
 #	    $cyear, $cmonth, $cmday, $chour, $cmin, $csec, $wday );
 	my $firstmonth = &revlocaltime($csec,$cmin,$chour,1,$cmonth-1,$cyear-1900);
 	($cyear,$cmonth,$cmday,$chour,$cmin,$csec,$wday)
@@ -522,7 +601,7 @@ sub calendar
 		: $datetext );
 	    push( @toprint, "</a></b>" );
 	    if( my @entries_today =
-		&matching_entries($address,$cyear,$cmonth,$cmday) )
+		&matching_entries($uaf{address},$cyear,$cmonth,$cmday) )
 		{
 		foreach my $entry (
 		    sort {$a->{hhmm} cmp $b->{hhmm}} @entries_today )
@@ -540,7 +619,7 @@ sub calendar
 	    $check_month = $cmonth;
 	    ($cyear,$cmonth,$cmday,$chour,$cmin,$csec,$wday)
 		= &epoch_to_ymd($timeind);
-	    } while( $timeind<=$stop_at{$address} || $cmonth==$check_month );
+	    } while( $timeind<=$stop_at{$uaf{address}} || $cmonth==$check_month );
 	}
     push( @toprint, "</tr>\n<tr><th colspan=7>",
 	"<input type=text name=here value='",
@@ -583,28 +662,30 @@ sub footer()
 #########################################################################
 sub userpage_handler
     {
+    my %uaf = &user_address_file();
+
     $cpi_vars::FORM{here} ||= &time_string("%04d-%02d-%02d");
     $cpi_vars::FORM{new_entry} ||= "";
     $cpi_vars::FORM{old_entry} ||= "";
     if( $cpi_vars::FORM{new_entry} && ! $cpi_vars::FORM{old_entry} )
         {
-	&append_file( $ARGS{file},
+	&append_file( $uaf{file},
 	    sprintf("%10s %s\n",
 		$cpi_vars::FORM{here}, $cpi_vars::FORM{new_entry} ) );
-	&read_remind_file();
+	&read_remind_file( $uaf{address} );
 	}
     else
         {
-	&read_remind_file();
+	&read_remind_file( $uaf{address} );
 	if( $cpi_vars::FORM{new_entry} ne $cpi_vars::FORM{old_entry} )
 	    {
 	    foreach my $entry (
-		&matching_entries($address,split(/-/,$cpi_vars::FORM{here}) ) )
+		&matching_entries($uaf{address},split(/-/,$cpi_vars::FORM{here}) ) )
 		{
 		$entry->{rest} = $cpi_vars::FORM{new_entry}
 		    if( $entry->{rest} eq $cpi_vars::FORM{old_entry} );
 		}
-	    &do_sort();	# Write out the now modified data
+	    &do_sort( $uaf{address} );	# Write out the now modified data
 	    }
 	}
 
@@ -618,7 +699,7 @@ function get_an_entry( datestr, old_entry )
     {
     with ( window.document )
         {
-	var prompt_val = "XL(Enter hh:mm entry for) "+datestr;
+	var prompt_val = "XL(Enter entry for) "+datestr;
 	var new_value =
 	    ( typeof old_entry === 'undefined'
 	    ? prompt(prompt_val)
@@ -638,7 +719,7 @@ function get_an_entry( datestr, old_entry )
 </head><body $cpi_vars::BODY_TAGS>
 $cpi_vars::HELP_IFRAME
 <form name=$FORM_NAME method=post>
-<input type=hidden name=SID value=$cpi_vars::FORM{SID}>
+<input type=hidden name=SID value=$cpi_vars::SID>
 <input type=hidden name=USER value=$cpi_vars::USER>
 <input type=hidden name=func value=Update>
 <input type=hidden name=new_entry>
@@ -706,8 +787,8 @@ print "today=[$today]\n" if( $ARGS{verbosity} );
 if( $ENV{SCRIPT_NAME} || $ARGS{mode} eq "html" )
     { &userpage_handler(); }
 elsif( $ARGS{mode} eq "sort" )
-    { &read_remind_file(); &do_sort(); }
+    { grep( &do_sort($_), &schedule_list() ); }
 elsif( &inlist($ARGS{mode},"mail","show") )
-    { &generate_message( $ARGS{mode} ); }
+    { grep( &generate_message($ARGS{mode},$_), &schedule_list() ); }
 
 exit($exit_stat);
